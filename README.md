@@ -52,15 +52,19 @@
 |---|---|---|
 | `mode` | `TargetItems` | Choose between `TargetItems` (custom list), `AllInventory`, or `HeldItem`. |
 | `items` | `[empty]` | List of items the module will automatically look for and duplicate. |
+| `cycle-items` | `true` | Alternates between all selected items in round-robin fashion. |
 | `recipe` | `Stick` | Recipe used to trigger the desync exploit (`Stick` or `CraftingTable`). |
 | `auto-repeat` | `true` | Runs dupe cycles automatically in a continuous loop. |
-| `delay` | `4` ticks | Delay in ticks between dupe cycles (allows picking items up). |
+| `delay` | `6` ticks | Base delay in ticks between dupe cycles. |
+| `smart-pickup` | `true` | Waits until dropped items under feet are collected to prevent loss. |
+| `clean-crafting-grid` | `true` | Automatically moves planks trapped in crafting grid back to inventory. |
 | `drop-all` | `false` | Drops the entire stack instead of one item at a time. |
 | `rotation-mode` | `Silent` | How to look down (`Silent` packets, `Client` view, or `None`). |
 | `auto-store` | `true` | Automatically deposits duped items into a nearby chest when inventory is full. |
 | `chest-range` | `4` | Search radius in blocks for chests/barrels/shulkers. |
 | `keep-stacks` | `1` | Number of stacks to keep in your inventory so you can continue duping. |
 | `empty-slots-threshold` | `2` | Triggers container storage when remaining empty slots reach or drop below this amount. |
+| `deposit-per-tick` | `3` | How many stacks to move into the container each tick (prevents packet kick). |
 
 ## Credits
 

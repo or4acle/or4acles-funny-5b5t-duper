@@ -13,12 +13,12 @@ import net.minecraft.block.TrappedChestBlock;
 import net.minecraft.block.BarrelBlock;
 import net.minecraft.block.ShulkerBoxBlock;
 import net.minecraft.client.gui.screen.recipebook.RecipeResultCollection;
+import net.minecraft.entity.ItemEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.packet.c2s.play.CraftRequestC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
 import net.minecraft.recipe.RecipeEntry;
-import net.minecraft.recipe.RecipeMatcher;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.screen.ShulkerBoxScreenHandler;
@@ -30,6 +30,8 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -72,12 +74,27 @@ public class Auto5b5tDupe extends Module {
 
     private final Setting<Integer> delay = sgGeneral.add(new IntSetting.Builder()
         .name("delay")
-        .description("Delay in ticks between dupe cycles (allows picking up items).")
-        .defaultValue(4)
+        .description("Tick delay between dupe cycles.")
+        .defaultValue(5)
         .min(1)
         .max(40)
         .sliderRange(1, 20)
         .visible(autoRepeat::get)
+        .build()
+    );
+
+    private final Setting<Boolean> smartPickup = sgGeneral.add(new BoolSetting.Builder()
+        .name("smart-pickup")
+        .description("Wait until dropped items under feet are collected before advancing to next item.")
+        .defaultValue(true)
+        .visible(autoRepeat::get)
+        .build()
+    );
+
+    private final Setting<Boolean> cleanGrid = sgGeneral.add(new BoolSetting.Builder()
+        .name("clean-crafting-grid")
+        .description("Automatically move planks trapped in crafting grid back to inventory.")
+        .defaultValue(true)
         .build()
     );
 
@@ -112,7 +129,7 @@ public class Auto5b5tDupe extends Module {
 
     private final Setting<Integer> chestRange = sgChest.add(new IntSetting.Builder()
         .name("chest-range")
-        .description("Radius in blocks to search for chests, barrels, or shulkers.")
+        .description("Horizontal radius in blocks to search for chests, barrels, or shulkers.")
         .defaultValue(4)
         .min(1)
         .max(6)
@@ -123,7 +140,7 @@ public class Auto5b5tDupe extends Module {
 
     private final Setting<Integer> keepStacks = sgChest.add(new IntSetting.Builder()
         .name("keep-stacks")
-        .description("How many stacks of the duped item to keep in inventory to continue duping.")
+        .description("How many stacks of each duped item to keep in inventory to continue duping.")
         .defaultValue(1)
         .min(1)
         .max(5)
@@ -143,45 +160,84 @@ public class Auto5b5tDupe extends Module {
         .build()
     );
 
+    private final Setting<Integer> depositPerTick = sgChest.add(new IntSetting.Builder()
+        .name("deposit-per-tick")
+        .description("How many stacks to move into the container each tick (prevents packet kick).")
+        .defaultValue(3)
+        .min(1)
+        .max(9)
+        .sliderRange(1, 9)
+        .visible(autoStore::get)
+        .build()
+    );
+
     // --- State Variables ---
     private Phase phase = Phase.PREPARE;
     private int timer = 0;
     private int chestTimeout = 0;
-    private RecipeMatcher recipeFinder;
-    private RecipeEntry<?> stickRecipe;
+    private int pickupWaitTimer = 0;
+    private RecipeEntry<?> recipeEntry;
     private float oldPitch;
     private boolean pitchChanged = false;
     private Item lastDupedItem = null;
+    private final Deque<Integer> pendingSlots = new ArrayDeque<>();
+    private int totalDuped = 0;
+
+    // Deposit state
+    private final Map<Item, Integer> depositBudget = new HashMap<>();
+    private int depositCursor = 0;
+    private int movedThisRun = 0;
 
     public Auto5b5tDupe() {
         super(DuperAddon.CATEGORY, "auto-5b5t-dupe", "Automatically dupes multiple items with chest storage on 5b5t.");
     }
 
     @Override
+    public String getInfoString() {
+        if (!isActive()) return null;
+        if (totalDuped > 0) {
+            return totalDuped + " duped";
+        }
+        return phase.name();
+    }
+
+    @Override
     public void onActivate() {
-        if (mc.player == null || mc.world == null) {
+        if (!canAct()) {
             toggle();
             return;
         }
 
-        recipeFinder = new RecipeMatcher();
         pitchChanged = false;
         timer = 0;
         chestTimeout = 0;
+        pickupWaitTimer = 0;
         lastDupedItem = null;
+        pendingSlots.clear();
+        depositBudget.clear();
+        totalDuped = 0;
+        recipeEntry = null;
 
+        if (cleanGrid.get()) {
+            clearCraftingGrid();
+        }
+
+        if (!findRecipe()) {
+            ChatUtils.error("Recipe for " + recipeMode.get().item.getName().getString() + " not found in recipe book!");
+            toggle();
+            return;
+        }
+
+        // Single instant desync: fires one craft request without dropping anything.
         if (single.get()) {
-            mc.player.getInventory().populateRecipeFinder(recipeFinder);
-            if (!placeRecipe(recipeFinder)) {
-                toggle();
-                return;
-            }
-            mc.player.networkHandler.sendPacket(new CraftRequestC2SPacket(mc.player.currentScreenHandler.syncId, stickRecipe, false));
+            mc.player.networkHandler.sendPacket(new CraftRequestC2SPacket(mc.player.currentScreenHandler.syncId, recipeEntry, false));
+            ChatUtils.info("Sent single craft desync packet.");
             toggle();
             return;
         }
 
         phase = Phase.PREPARE;
+        DuperAddon.LOG.info("{} enabled.", name);
     }
 
     @Override
@@ -189,11 +245,19 @@ public class Auto5b5tDupe extends Module {
         unrotate();
         phase = Phase.PREPARE;
         timer = 0;
+        pendingSlots.clear();
+        depositBudget.clear();
+
+        if (cleanGrid.get()) {
+            clearCraftingGrid();
+        }
+
+        DuperAddon.LOG.info("{} disabled. Duped {} items total.", name, totalDuped);
     }
 
     @EventHandler
     private void onPostTick(TickEvent.Post event) {
-        if (mc.player == null || mc.world == null) {
+        if (!canAct()) {
             toggle();
             return;
         }
@@ -204,178 +268,228 @@ public class Auto5b5tDupe extends Module {
         }
 
         switch (phase) {
-            case PREPARE -> {
-                // Check if inventory is full and autoStore is enabled
-                if (autoStore.get() && getEmptySlotsCount() <= emptySlotsThreshold.get()) {
-                    BlockPos chestPos = findNearbyChest(chestRange.get());
-                    if (chestPos != null) {
-                        BlockHitResult hitResult = new BlockHitResult(Vec3d.ofCenter(chestPos), Direction.UP, chestPos, false);
-                        mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hitResult);
-                        phase = Phase.OPEN_CHEST;
-                        chestTimeout = 25;
-                        timer = 2;
-                        return;
-                    } else {
-                        ChatUtils.warning("Inventory is full and no nearby chest was found!");
-                        toggle();
-                        return;
-                    }
-                }
+            case PREPARE -> phasePrepare();
+            case DROP_AND_CRAFT -> phaseDropAndCraft();
+            case WAIT_PICKUP -> phaseWaitPickup();
+            case OPEN_CHEST -> phaseOpenChest();
+            case DEPOSIT_CHEST -> phaseDepositChest();
+        }
+    }
 
-                // Verify recipe ingredients
-                mc.player.getInventory().populateRecipeFinder(recipeFinder);
-                if (!placeRecipe(recipeFinder)) {
-                    toggle();
-                    return;
-                }
+    // --- Phases ---
 
-                // Select next item to dupe according to mode
-                if (!selectItemToDupe()) {
-                    toggle();
-                    return;
-                }
+    private void phasePrepare() {
+        if (cleanGrid.get()) {
+            clearCraftingGrid();
+        }
 
-                // Apply rotation
-                rotate();
+        // Verify wood planks exist
+        if (!hasPlanks()) {
+            ChatUtils.error("No wood planks found in inventory for " + recipeMode.get().item.getName().getString() + "!");
+            toggle();
+            return;
+        }
 
-                phase = Phase.DROP;
-                timer = 1;
+        // Ensure recipe entry is cached
+        if (recipeEntry == null && !findRecipe()) {
+            ChatUtils.error("Could not find recipe for " + recipeMode.get().item.getName().getString());
+            toggle();
+            return;
+        }
+
+        // Check if inventory is getting full and auto store is enabled
+        if (autoStore.get() && getEmptySlotsCount() <= emptySlotsThreshold.get()) {
+            BlockPos chestPos = findNearbyChest(chestRange.get());
+            if (chestPos != null) {
+                BlockHitResult hitResult = new BlockHitResult(Vec3d.ofCenter(chestPos), Direction.UP, chestPos, false);
+                mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hitResult);
+                phase = Phase.OPEN_CHEST;
+                chestTimeout = 30;
+                timer = 2;
+                return;
             }
 
-            case DROP -> {
-                ItemStack held = mc.player.getMainHandStack();
-                if (held.isEmpty()) {
-                    unrotate();
-                    phase = Phase.PREPARE;
-                    return;
-                }
+            ChatUtils.warning("Inventory is full and no nearby container was found!");
+            toggle();
+            return;
+        }
 
-                lastDupedItem = held.getItem();
-                mc.player.dropSelectedItem(dropAll.get());
-                phase = Phase.CRAFT;
-                timer = 1;
-            }
-
-            case CRAFT -> {
-                unrotate();
-                mc.player.networkHandler.sendPacket(new CraftRequestC2SPacket(mc.player.currentScreenHandler.syncId, stickRecipe, false));
-
-                if (!autoRepeat.get()) {
-                    toggle();
-                    return;
-                }
-
+        // Build the queue of slots to dupe for this cycle
+        pendingSlots.clear();
+        collectSlots(pendingSlots);
+        if (pendingSlots.isEmpty()) {
+            // Check if dropped items are currently on the ground waiting to be picked up
+            if (hasNearbyDroppedItem()) {
                 phase = Phase.WAIT_PICKUP;
-                timer = delay.get();
+                timer = 2;
+                return;
             }
+            ChatUtils.warning("No eligible items found in inventory to dupe.");
+            toggle();
+            return;
+        }
 
-            case WAIT_PICKUP -> {
-                // Transition back to prepare for next cycle
-                phase = Phase.PREPARE;
+        if (!advanceSlot()) {
+            toggle();
+            return;
+        }
+
+        phase = Phase.DROP_AND_CRAFT;
+        timer = 1; // 1 tick to ensure slot selection/swap has settled
+    }
+
+    private void phaseDropAndCraft() {
+        ItemStack held = mc.player.getMainHandStack();
+        if (held.isEmpty()) {
+            // Hotbar hand is empty, re-check inventory
+            phase = Phase.PREPARE;
+            timer = 1;
+            return;
+        }
+
+        lastDupedItem = held.getItem();
+
+        // 1. Rotate down to feet
+        rotate();
+
+        // 2. Drop item from hand
+        mc.player.dropSelectedItem(dropAll.get());
+
+        // 3. Send craft request desync packet immediately in the same network frame
+        mc.player.networkHandler.sendPacket(new CraftRequestC2SPacket(mc.player.currentScreenHandler.syncId, recipeEntry, false));
+
+        // 4. Restore rotation
+        unrotate();
+
+        totalDuped++;
+        pickupWaitTimer = 0;
+        phase = Phase.WAIT_PICKUP;
+        timer = Math.max(1, delay.get());
+    }
+
+    private void phaseWaitPickup() {
+        // If smart pickup is enabled, wait until dropped items under feet are collected
+        if (smartPickup.get() && hasNearbyDroppedItem()) {
+            if (pickupWaitTimer++ < 30) {
+                timer = 2;
+                return;
             }
+        }
 
-            case OPEN_CHEST -> {
-                if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler || mc.player.currentScreenHandler instanceof ShulkerBoxScreenHandler) {
-                    phase = Phase.DEPOSIT_CHEST;
-                    timer = 2;
-                    return;
-                }
+        if (cleanGrid.get()) {
+            clearCraftingGrid();
+        }
 
-                if (chestTimeout-- <= 0) {
-                    ChatUtils.warning("Failed to open container in time.");
-                    phase = Phase.PREPARE;
-                    timer = delay.get();
-                }
+        // If more slots were queued in this round, advance to the next one
+        if (!pendingSlots.isEmpty()) {
+            if (advanceSlot()) {
+                phase = Phase.DROP_AND_CRAFT;
+                timer = 1;
+                return;
             }
+        }
 
-            case DEPOSIT_CHEST -> {
-                depositToContainer();
-                mc.player.closeHandledScreen();
-                ChatUtils.info("Deposited items into chest. Resuming dupe...");
-                phase = Phase.PREPARE;
-                timer = delay.get();
-            }
+        // Round finished.
+        if (!autoRepeat.get()) {
+            ChatUtils.info("Finished dupe cycle. Duped " + totalDuped + " items total.");
+            toggle();
+            return;
+        }
+
+        // Continue next round
+        phase = Phase.PREPARE;
+        timer = 1;
+    }
+
+    private void phaseOpenChest() {
+        if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler || mc.player.currentScreenHandler instanceof ShulkerBoxScreenHandler) {
+            depositBudget.clear();
+            buildDepositBudget();
+            depositCursor = 0;
+            movedThisRun = 0;
+            phase = Phase.DEPOSIT_CHEST;
+            timer = 1;
+            return;
+        }
+
+        if (chestTimeout-- <= 0) {
+            ChatUtils.warning("Failed to open container in time. Resuming dupe...");
+            phase = Phase.PREPARE;
+            timer = delay.get();
         }
     }
 
-    private boolean selectItemToDupe() {
-        switch (dupeMode.get()) {
-            case HeldItem -> {
-                if (mc.player.getMainHandStack().isEmpty()) {
-                    ChatUtils.error("Hold an item to dupe in your hand.");
-                    return false;
-                }
-                return true;
-            }
-
-            case TargetItems -> {
-                List<Item> targetList = itemsToDupe.get();
-                if (targetList == null || targetList.isEmpty()) {
-                    ChatUtils.error("No items selected to dupe in settings.");
-                    return false;
-                }
-
-                // Look for an item from target list in inventory
-                int slot = findItemSlot(targetList);
-                if (slot == -1) {
-                    ChatUtils.warning("None of the target items were found in your inventory.");
-                    return false;
-                }
-
-                return selectSlot(slot);
-            }
-
-            case AllInventory -> {
-                // Find any item that isn't empty and isn't a crafting ingredient
-                int slot = findAnyDupeableSlot();
-                if (slot == -1) {
-                    ChatUtils.warning("No dupeable items found in inventory.");
-                    return false;
-                }
-
-                return selectSlot(slot);
-            }
+    private void phaseDepositChest() {
+        if (!depositBudget.isEmpty()) {
+            depositSlice(depositPerTick.get());
         }
-        return false;
+
+        if (depositBudget.isEmpty()) {
+            mc.player.closeHandledScreen();
+            ChatUtils.info("Deposited " + movedThisRun + " stacks into container. Resuming dupe...");
+            depositBudget.clear();
+            phase = Phase.PREPARE;
+            timer = delay.get();
+        } else {
+            // Continue moving remaining stacks next tick
+            timer = 1;
+        }
     }
 
-    private int findItemSlot(List<Item> targets) {
+    // --- Slot Selection ---
+
+    private void collectSlots(Deque<Integer> out) {
+        if (mc.player == null) return;
+
+        if (dupeMode.get() == DupeMode.HeldItem) {
+            if (!mc.player.getMainHandStack().isEmpty()) {
+                out.add(mc.player.getInventory().selectedSlot);
+            } else {
+                ChatUtils.error("Hold an item to dupe in your hand.");
+            }
+            return;
+        }
+
+        List<Item> targets = dupeMode.get() == DupeMode.TargetItems ? itemsToDupe.get() : null;
+        if (dupeMode.get() == DupeMode.TargetItems && (targets == null || targets.isEmpty())) {
+            ChatUtils.error("No items selected to dupe in settings.");
+            return;
+        }
+
+        int queued = 0;
         // Check hotbar first (0-8)
         for (int i = 0; i < 9; i++) {
             ItemStack stack = mc.player.getInventory().getStack(i);
-            if (!stack.isEmpty() && targets.contains(stack.getItem())) {
-                return i;
+            if (stack.isEmpty() || isCraftIngredient(stack)) continue;
+
+            if (dupeMode.get() == DupeMode.AllInventory || targets.contains(stack.getItem())) {
+                out.add(i);
+                queued++;
             }
         }
-        // Then main inventory (9-35)
+
+        // Then check main inventory (9-35)
         for (int i = 9; i < 36; i++) {
             ItemStack stack = mc.player.getInventory().getStack(i);
-            if (!stack.isEmpty() && targets.contains(stack.getItem())) {
-                return i;
+            if (stack.isEmpty() || isCraftIngredient(stack)) continue;
+
+            if (dupeMode.get() == DupeMode.AllInventory || targets.contains(stack.getItem())) {
+                out.add(i);
+                queued++;
             }
         }
-        return -1;
+
+        if (queued == 0) {
+            ChatUtils.warning(dupeMode.get() == DupeMode.AllInventory
+                ? "No dupeable items found in inventory."
+                : "None of the target items were found in your inventory.");
+        }
     }
 
-    private int findAnyDupeableSlot() {
-        // Check hotbar first
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = mc.player.getInventory().getStack(i);
-            if (!stack.isEmpty() && !isCraftIngredient(stack)) {
-                return i;
-            }
-        }
-        // Check main inventory
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = mc.player.getInventory().getStack(i);
-            if (!stack.isEmpty() && !isCraftIngredient(stack)) {
-                return i;
-            }
-        }
-        return -1;
-    }
+    private boolean advanceSlot() {
+        if (mc.player == null || pendingSlots.isEmpty()) return false;
 
-    private boolean selectSlot(int invSlot) {
+        int invSlot = pendingSlots.poll();
         if (invSlot < 9) {
             mc.player.getInventory().selectedSlot = invSlot;
             return true;
@@ -387,11 +501,128 @@ public class Auto5b5tDupe extends Module {
         return true;
     }
 
+    // --- Ingredients & Grid Cleaning ---
+
+    private boolean findRecipe() {
+        if (mc.player == null || mc.world == null) return false;
+        if (recipeEntry != null) {
+            ItemStack result = recipeEntry.value().getResult(mc.world.getRegistryManager());
+            if (result.getItem() == recipeMode.get().item) {
+                return true;
+            }
+        }
+
+        List<RecipeResultCollection> recipeList = mc.player.getRecipeBook().getOrderedResults();
+        for (RecipeResultCollection collection : recipeList) {
+            for (RecipeEntry<?> entry : collection.getAllRecipes()) {
+                ItemStack resultStack = entry.value().getResult(mc.world.getRegistryManager());
+                if (resultStack.getItem() == recipeMode.get().item) {
+                    recipeEntry = entry;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean hasPlanks() {
+        if (mc.player == null) return false;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getStack(i);
+            if (!stack.isEmpty() && (stack.isIn(ItemTags.PLANKS) || stack.getItem() == STICK || stack.getItem() == CRAFTING_TABLE)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void clearCraftingGrid() {
+        if (mc.player == null) return;
+        for (int i = 1; i <= 4; i++) {
+            Slot slot = mc.player.playerScreenHandler.getSlot(i);
+            if (slot != null && !slot.getStack().isEmpty()) {
+                mc.interactionManager.clickSlot(mc.player.playerScreenHandler.syncId, i, 0, SlotActionType.QUICK_MOVE, mc.player);
+            }
+        }
+    }
+
     private boolean isCraftIngredient(ItemStack stack) {
         if (stack.isEmpty()) return false;
         if (stack.isIn(ItemTags.PLANKS) || stack.isIn(ItemTags.LOGS)) return true;
         Item item = stack.getItem();
         return item == STICK || item == CRAFTING_TABLE;
+    }
+
+    private boolean hasNearbyDroppedItem() {
+        if (mc.world == null || mc.player == null) return false;
+        List<ItemEntity> items = mc.world.getEntitiesByClass(
+            ItemEntity.class,
+            mc.player.getBoundingBox().expand(1.8),
+            entity -> entity.isAlive() && !entity.getStack().isEmpty()
+        );
+        return !items.isEmpty();
+    }
+
+    // --- Auto Chest / Sorting ---
+
+    private void buildDepositBudget() {
+        depositBudget.clear();
+        if (mc.player == null) return;
+
+        Map<Item, Integer> stackCounts = new HashMap<>();
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getStack(i);
+            if (stack.isEmpty()) continue;
+            if (!shouldDeposit(stack)) continue;
+
+            Item item = stack.getItem();
+            stackCounts.put(item, stackCounts.getOrDefault(item, 0) + 1);
+        }
+
+        for (Map.Entry<Item, Integer> entry : stackCounts.entrySet()) {
+            int excess = entry.getValue() - keepStacks.get();
+            if (excess > 0) {
+                depositBudget.put(entry.getKey(), excess);
+            }
+        }
+    }
+
+    private void depositSlice(int amount) {
+        if (mc.player == null || mc.player.currentScreenHandler == null) return;
+
+        var handler = mc.player.currentScreenHandler;
+        int moved = 0;
+
+        for (; depositCursor < handler.slots.size(); depositCursor++) {
+            if (moved >= amount) return;
+
+            Slot slot = handler.slots.get(depositCursor);
+            if (slot.inventory != mc.player.getInventory() || slot.getStack().isEmpty()) continue;
+
+            Item item = slot.getStack().getItem();
+            int remaining = depositBudget.getOrDefault(item, 0);
+            if (remaining <= 0) continue;
+
+            mc.interactionManager.clickSlot(handler.syncId, slot.id, 0, SlotActionType.QUICK_MOVE, mc.player);
+            depositBudget.put(item, remaining - 1);
+            moved++;
+            movedThisRun++;
+        }
+
+        // If we reached the end of the inventory slots, clean up budget
+        if (depositCursor >= handler.slots.size()) {
+            depositBudget.clear();
+        }
+    }
+
+    private boolean shouldDeposit(ItemStack stack) {
+        if (isCraftIngredient(stack)) return false;
+
+        return switch (dupeMode.get()) {
+            case TargetItems -> itemsToDupe.get() != null && itemsToDupe.get().contains(stack.getItem());
+            case AllInventory -> true;
+            case HeldItem -> lastDupedItem != null && stack.getItem() == lastDupedItem;
+        };
     }
 
     private int getEmptySlotsCount() {
@@ -412,7 +643,7 @@ public class Auto5b5tDupe extends Module {
         double bestDist = Double.MAX_VALUE;
 
         for (int x = -range; x <= range; x++) {
-            for (int y = -range; y <= range; y++) {
+            for (int y = -1; y <= 1; y++) {
                 for (int z = -range; z <= range; z++) {
                     BlockPos pos = playerPos.add(x, y, z);
                     BlockState state = mc.world.getBlockState(pos);
@@ -431,90 +662,33 @@ public class Auto5b5tDupe extends Module {
         return bestPos;
     }
 
-    private void depositToContainer() {
-        if (mc.player == null || mc.player.currentScreenHandler == null) return;
-
-        var handler = mc.player.currentScreenHandler;
-
-        // Count how many stacks of each deposit-eligible item the player currently holds
-        Map<Item, Integer> stackCounts = new HashMap<>();
-        for (Slot slot : handler.slots) {
-            if (slot.inventory == mc.player.getInventory() && !slot.getStack().isEmpty()) {
-                ItemStack stack = slot.getStack();
-                if (shouldDeposit(stack)) {
-                    stackCounts.put(stack.getItem(), stackCounts.getOrDefault(stack.getItem(), 0) + 1);
-                }
-            }
-        }
-
-        // Determine how many excess stacks of each item can be deposited
-        Map<Item, Integer> excessToDeposit = new HashMap<>();
-        for (Map.Entry<Item, Integer> entry : stackCounts.entrySet()) {
-            int excess = entry.getValue() - keepStacks.get();
-            if (excess > 0) {
-                excessToDeposit.put(entry.getKey(), excess);
-            }
-        }
-
-        // Transfer excess stacks to container via QUICK_MOVE (shift-click)
-        for (Slot slot : handler.slots) {
-            if (slot.inventory == mc.player.getInventory() && !slot.getStack().isEmpty()) {
-                ItemStack stack = slot.getStack();
-                Item item = stack.getItem();
-                int remaining = excessToDeposit.getOrDefault(item, 0);
-                if (remaining > 0) {
-                    mc.interactionManager.clickSlot(handler.syncId, slot.id, 0, SlotActionType.QUICK_MOVE, mc.player);
-                    excessToDeposit.put(item, remaining - 1);
-                }
-            }
-        }
-    }
-
-    private boolean shouldDeposit(ItemStack stack) {
-        if (isCraftIngredient(stack)) return false;
-
-        return switch (dupeMode.get()) {
-            case TargetItems -> itemsToDupe.get() != null && itemsToDupe.get().contains(stack.getItem());
-            case AllInventory -> true;
-            case HeldItem -> lastDupedItem != null && stack.getItem() == lastDupedItem;
-        };
-    }
+    // --- Rotation ---
 
     private void rotate() {
+        if (mc.player == null) return;
         switch (rotationMode.get()) {
-            case Silent -> mc.world.sendPacket(new PlayerMoveC2SPacket.LookAndOnGround(mc.player.headYaw, 90f, true));
+            case Silent -> mc.player.networkHandler.sendPacket(new PlayerMoveC2SPacket.LookAndOnGround(mc.player.getYaw(), 90.0f, mc.player.isOnGround()));
             case Client -> {
                 oldPitch = mc.player.getPitch();
                 pitchChanged = true;
-                mc.player.setPitch(90f);
+                mc.player.setPitch(90.0f);
             }
             case None -> {}
         }
     }
 
     private void unrotate() {
-        if (pitchChanged && rotationMode.get() == RotationMode.Client) {
+        if (mc.player != null && pitchChanged && rotationMode.get() == RotationMode.Client) {
             mc.player.setPitch(oldPitch);
             pitchChanged = false;
         }
     }
 
-    boolean placeRecipe(RecipeMatcher recipeFinder) {
-        List<RecipeResultCollection> recipeList = mc.player.getRecipeBook().getOrderedResults();
-        for (RecipeResultCollection recipe : recipeList) {
-            for (RecipeEntry<?> entry : recipe.getAllRecipes()) {
-                ItemStack resultStack = entry.value().getResult(mc.world.getRegistryManager());
-                if (resultStack.getItem() == recipeMode.get().item) {
-                    if (!recipeFinder.match(entry.value(), null)) {
-                        ChatUtils.error("No ingredients in inventory for " + recipeMode.get().item.getName().getString());
-                        return false;
-                    }
-                    stickRecipe = entry;
-                    return true;
-                }
-            }
-        }
-        return false;
+    // --- Helpers ---
+
+    private boolean canAct() {
+        return mc.player != null && mc.world != null && mc.interactionManager != null
+            && mc.player.networkHandler != null && mc.player.currentScreenHandler != null;
     }
 
     public enum DupeMode {
@@ -525,8 +699,7 @@ public class Auto5b5tDupe extends Module {
 
     private enum Phase {
         PREPARE,
-        DROP,
-        CRAFT,
+        DROP_AND_CRAFT,
         WAIT_PICKUP,
         OPEN_CHEST,
         DEPOSIT_CHEST
@@ -549,4 +722,3 @@ public class Auto5b5tDupe extends Module {
         }
     }
 }
-
