@@ -64,6 +64,7 @@
 
 ## Credits
 
-- **or4acle** - Multi-item dupe logic & auto-chest storer
+- **or4acle** - multi item dupe and chest sorter stuff idsfojsjidf
 - **StorageESP** - Initial addon base
 - **Meteor Development** - [Meteor Client](https://meteorclient.com)
+- **[BepHax](https://github.com/dekrom/BepHaxAddon/)** by [dekrom](https://github.com/dekrom) and **[AutoBookshelf](https://github.com/oehrasa/Oehrasa-Bookies-Addon)** by [oehrasa](https://github.com/oehrasa) - this readme :)))))))))))))))
