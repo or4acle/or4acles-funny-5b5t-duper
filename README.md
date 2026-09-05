@@ -1,6 +1,6 @@
 <div align="center">
   <!-- Logo and Title -->
-  <img src="https://raw.githubusercontent.com/or4acle/5b5t-autoduper-addon/refs/heads/master/logo.png" alt="logo" width="30%"/>
+  <img src="https://raw.githubusercontent.com/or4acle/or4acles-funny-5b5t-duper/refs/heads/main/assets/logo.png" alt="logo" width="30%"/>
   <h1>or4acle's Funny 5b5t Auto Duper</h1>
   <p>super cool skidded duper & chest storer for 5b5t</p>
 
