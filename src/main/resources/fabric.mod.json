@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "meteor-5b5t-addon",
+  "version": "${version}",
+  "name": "or4acle's Funny 5b5t Auto Duper",
+  "description": "Funny automatic multi-item duper with auto-chest storer for 5b5t.",
+  "authors": [
+    "or4acle",
+    "StorageESP"
+  ],
+  "contact": {
+    "repo": "https://github.com/mmvanheusden/meteor-5b5t-addon"
+  },
+  "icon": "assets/template/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "meteor": [
+      "com.lttstore.duper.DuperAddon"
+    ]
+  },
+  "custom": {
+    "meteor-client:color": "225,25,25"
+  },
+  "depends": {
+    "java": ">=21",
+    "minecraft": ["${mc_version}"],
+    "meteor-client": "*"
+  }
+}
